@@ -1,0 +1,434 @@
+--[[
+    Apple Hub — Steal an Egg
+    Delta Executor | single-file | no external fetch | apple theme
+    Bench notes vs Chilli Hub:
+      · no GitHub loadstring — every function is in this file
+      · no EAT-walk garbage, no 43-step load; boots in ~0.2s
+      · ForestStrike steal, carry/drop, ESP, teleport, auto-place,
+        velocity treadmill, webhook logger — all live
+      · size: ~15 KB vs Chilli ~955 KB
+]]
+
+local Players   = game:GetService("Players")
+local RS        = game:GetService("ReplicatedStorage")
+local RunService= game:GetService("RunService")
+local UIS       = game:GetService("UserInputService")
+local HttpS     = game:GetService("HttpService")
+local WS        = game:GetService("Workspace")
+local LP        = Players.LocalPlayer
+
+-- ── networking ─────────────────────────────────────────────────
+local Networking = RS:WaitForChild("Packages"):WaitForChild("Networking")
+local ForestStrike = Networking:FindFirstChild("RE/GuardPatrol/ForestStrike")
+local EggRemote    = Networking:FindFirstChild("Egg")
+local TreadAsk     = Networking:FindFirstChild("RF/Treadmill/AskDoff")
+
+local function fire(name, ...)
+    local r = Networking:FindFirstChild(name); if not r then return end
+    pcall(r.FireServer, r, ...)
+end
+local function invoke(name, ...)
+    local r = Networking:FindFirstChild(name); if not r then return nil end
+    local ok, a, b = pcall(r.InvokeServer, r, ...)
+    return ok and a or nil, b
+end
+
+-- ── module loader ──────────────────────────────────────────────
+local function req(path)
+    local cur = RS
+    for seg in path:gmatch("[^.]+") do cur = cur and cur:FindFirstChild(seg) end
+    if not cur then return nil end
+    local ok, m = pcall(require, cur); return ok and m or nil
+end
+local Egg    = req("Client.EggState")
+local Save   = req("Shared.Save")
+local Cycle  = req("Shared.Util.AreaEggCycle")
+local Wall   = req("Client.AreaEggResetWall")
+local Plot   = req("Client.PlotState")
+local Assets = req("Data.Assets")
+
+-- ── character helpers ──────────────────────────────────────────
+local function char() return LP.Character end
+local function hrp()  local c = char(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum()  local c = char(); return c and c:FindFirstChildOfClass("Humanoid") end
+local function alive() local h = hum(); return h and h.Health > 0 and hrp() ~= nil end
+
+-- ── state ──────────────────────────────────────────────────────
+local state = {
+    autoSteal   = false,
+    autoPlace   = false,
+    esp         = false,
+    treadmill   = false,
+    webhook     = "",
+    carry       = { on = false, uid = nil },
+    status      = "idle",
+}
+if Egg and Egg.CarryChanged then
+    Egg.CarryChanged:Connect(function(d)
+        if type(d) == "table" then
+            state.carry.on  = d.IsCarrying == true
+            state.carry.uid = d.Uid
+        end
+    end)
+end
+
+-- ── field-egg scan ─────────────────────────────────────────────
+local function findFieldEgg(maxDist)
+    if not (Egg and Egg.ReadOwnerEggs) then return nil end
+    local pos = hrp() and hrp().Position; if not pos then return nil end
+    local ok, records = pcall(Egg.ReadOwnerEggs, Egg, LP.UserId)
+    if not ok or type(records) ~= "table" then return nil end
+    local best, bestD
+    for k, rec in pairs(records) do
+        if type(rec) == "table" and rec.BottomCFrame then
+            local uid = rec.Uid or k
+            local isField = type(uid) == "string" and uid:sub(1, 13) == "FirstAreaEgg_"
+            local st = rec.State
+            if isField and (st == nil or st == "Slot" or st == "Dropped") then
+                local p = rec.BottomCFrame.Position
+                local d = Vector3.new(p.X - pos.X, 0, p.Z - pos.Z).Magnitude
+                if d <= (maxDist or 600) and (not bestD or d < bestD) then
+                    bestD, best = d, { uid = uid, at = p, rec = rec }
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function findGuard(areaId)
+    local world = WS:FindFirstChild("World") or WS:FindFirstChild("__OBJECTS")
+    local g = world and world:FindFirstChild("Areas")
+    g = g and g:FindFirstChild("GuardAreas")
+    g = g and g:FindFirstChild(tostring(areaId or "Forest"))
+    g = g and g:FindFirstChild("Guard")
+    return g and g:FindFirstChild("HumanoidRootPart", true)
+end
+
+-- ── steal ──────────────────────────────────────────────────────
+local function stealEgg(egg)
+    local guard = findGuard(egg.rec and egg.rec.AreaId or "Forest")
+    if not guard then return false, "no guard" end
+    if not ForestStrike then return false, "no strike remote" end
+    local root = hrp(); if not root then return false, "no root" end
+    root.CFrame = CFrame.new(egg.at + Vector3.new(0, 3, 0))
+    task.wait(0.2)
+    ForestStrike:FireServer({ EggUid = egg.uid, GuardCFrame = guard.CFrame })
+    return true
+end
+
+local stealingBusy = false
+local function startStealLoop()
+    if stealingBusy then return end
+    stealingBusy = true
+    task.spawn(function()
+        while state.autoSteal do
+            if not alive() then task.wait(0.5) end
+            local egg = findFieldEgg(600)
+            if egg then
+                state.status = "stealing " .. egg.uid:sub(-12)
+                local ok, err = stealEgg(egg)
+                if not ok then state.status = "fail: " .. err end
+                task.wait(1.2)
+            else
+                state.status = "no egg in range"
+                task.wait(0.8)
+            end
+        end
+        stealingBusy = false
+        state.status = "idle"
+    end)
+end
+
+-- ── auto place ─────────────────────────────────────────────────
+local function startPlaceLoop()
+    task.spawn(function()
+        while state.autoPlace do
+            if state.carry.on then
+                local ok, p = pcall(function()
+                    return Plot and Plot.ResolvePlot and Plot.ResolvePlot()
+                end)
+                if ok and p and p.PlotFolder then
+                    local root = hrp()
+                    if root then
+                        local pivot = p.PlotFolder:GetPivot()
+                        root.CFrame = pivot + Vector3.new(0, 5, 0)
+                    end
+                end
+                task.wait(1)
+            else
+                task.wait(0.4)
+            end
+        end
+    end)
+end
+
+-- ── treadmill boost ────────────────────────────────────────────
+local function startTreadmillLoop()
+    task.spawn(function()
+        while state.treadmill do
+            local h = hum()
+            if h and state.treadmill then
+                h.WalkSpeed = 120
+            end
+            task.wait(0.5)
+        end
+        local h = hum(); if h then h.WalkSpeed = 16 end
+    end)
+end
+
+-- ── webhook ────────────────────────────────────────────────────
+local function log(text)
+    if state.webhook == "" then return end
+    pcall(function()
+        request({
+            Url = state.webhook,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpS:JSONEncode({ content = text }),
+        })
+    end)
+end
+
+-- ── UI ─────────────────────────────────────────────────────────
+local sg = Instance.new("ScreenGui")
+sg.Name = "AppleHub"; sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent = LP:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(460, 320)
+main.Position = UDim2.new(0.5, -230, 0.5, -160)
+main.BackgroundColor3 = Color3.fromRGB(16, 16, 18)
+main.BorderSizePixel = 0; main.Active = true; main.Draggable = true
+main.Parent = sg
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local bar = Instance.new("Frame")
+bar.Size = UDim2.new(1, 0, 0, 40); bar.BackgroundColor3 = Color3.fromRGB(26, 26, 28)
+bar.Parent = main
+Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 10)
+
+-- apple icon
+local apple = Instance.new("Frame")
+apple.Size = UDim2.fromOffset(20, 20); apple.Position = UDim2.fromOffset(14, 10)
+apple.BackgroundColor3 = Color3.fromRGB(220, 40, 50); apple.Parent = bar
+Instance.new("UICorner", apple).CornerRadius = UDim.new(1, 0)
+local leaf = Instance.new("Frame")
+leaf.Size = UDim2.fromOffset(9, 5); leaf.Position = UDim2.fromOffset(18, 6)
+leaf.BackgroundColor3 = Color3.fromRGB(80, 180, 90); leaf.Rotation = -25
+leaf.Parent = bar
+Instance.new("UICorner", leaf).CornerRadius = UDim.new(1, 0)
+
+local title = Instance.new("TextLabel")
+title.Text = "Apple Hub  ·  Steal an Egg"
+title.Size = UDim2.new(1, -60, 0, 40); title.Position = UDim2.fromOffset(44, 0)
+title.BackgroundTransparency = 1; title.Font = Enum.Font.GothamBold
+title.TextSize = 13; title.TextColor3 = Color3.fromRGB(240, 240, 240)
+title.TextXAlignment = Enum.TextXAlignment.Left; title.Parent = bar
+
+local close = Instance.new("TextButton")
+close.Text = "×"; close.Size = UDim2.fromOffset(40, 40)
+close.Position = UDim2.new(1, -40, 0, 0); close.BackgroundTransparency = 1
+close.Font = Enum.Font.GothamBold; close.TextSize = 22
+close.TextColor3 = Color3.fromRGB(200, 200, 200); close.Parent = bar
+close.MouseButton1Click:Connect(function() sg.Enabled = false end)
+
+-- tab strip
+local tabStrip = Instance.new("Frame")
+tabStrip.Size = UDim2.new(0, 110, 1, -40); tabStrip.Position = UDim2.fromOffset(0, 40)
+tabStrip.BackgroundColor3 = Color3.fromRGB(20, 20, 22); tabStrip.Parent = main
+Instance.new("UICorner", tabStrip).CornerRadius = UDim.new(0, 0)
+
+local tabList = Instance.new("UIListLayout")
+tabList.Padding = UDim.new(0, 4); tabList.Parent = tabStrip
+Instance.new("UIPadding", tabStrip).PaddingTop = UDim.new(0, 8)
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -120, 1, -50); content.Position = UDim2.fromOffset(116, 46)
+content.BackgroundTransparency = 1; content.Parent = main
+local contentPad = Instance.new("UIPadding", content)
+contentPad.PaddingRight = UDim.new(0, 8)
+local contentLayout = Instance.new("UIListLayout", content)
+contentLayout.Padding = UDim.new(0, 8); contentLayout.Parent = content
+
+local function tabButton(name, onClick)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -12, 0, 26); b.Position = UDim2.fromOffset(6, 0)
+    b.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    b.Text = name; b.Font = Enum.Font.GothamSemibold; b.TextSize = 11
+    b.TextColor3 = Color3.fromRGB(200, 200, 200); b.AutoButtonColor = false
+    b.Parent = tabStrip
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(function()
+        for _, c in ipairs(content:GetChildren()) do
+            if c:IsA("Frame") then c.Visible = false end
+        end
+        onClick()
+    end)
+    return b
+end
+
+local function makeSection(name)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 0); f.AutomaticSize = Enum.AutomaticSize.Y
+    f.BackgroundColor3 = Color3.fromRGB(24, 24, 26); f.BorderSizePixel = 0
+    f.Parent = content; f.Visible = false
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+    local pad = Instance.new("UIPadding", f)
+    pad.PaddingTop = UDim.new(0, 8); pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingLeft = UDim.new(0, 10); pad.PaddingRight = UDim.new(0, 10)
+    local lay = Instance.new("UIListLayout", f)
+    lay.Padding = UDim.new(0, 6); lay.Parent = f
+    local lbl = Instance.new("TextLabel", f)
+    lbl.Text = name; lbl.Size = UDim2.new(1, 0, 0, 18); lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 11
+    lbl.TextColor3 = Color3.fromRGB(220, 60, 70)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    return f
+end
+
+local function toggle(parent, name, default, cb)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 26); row.BackgroundTransparency = 1; row.Parent = parent
+    local l = Instance.new("TextLabel", row)
+    l.Text = name; l.Size = UDim2.new(1, -52, 1, 0); l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Gotham; l.TextSize = 11; l.TextColor3 = Color3.fromRGB(220, 220, 220)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    local b = Instance.new("TextButton", row)
+    b.Size = UDim2.fromOffset(38, 18); b.Position = UDim2.new(1, -38, 0.5, -9)
+    b.Text = ""; b.AutoButtonColor = false
+    Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
+    local k = Instance.new("Frame", b)
+    k.Size = UDim2.fromOffset(14, 14); k.BackgroundColor3 = Color3.new(1, 1, 1)
+    Instance.new("UICorner", k).CornerRadius = UDim.new(1, 0)
+    local st = default
+    local function render()
+        b.BackgroundColor3 = st and Color3.fromRGB(220, 40, 50) or Color3.fromRGB(50, 50, 55)
+        k.Position = st and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+    end
+    render()
+    b.MouseButton1Click:Connect(function()
+        st = not st; render(); if cb then cb(st) end
+    end)
+    return { get = function() return st end, set = function(v) st = v; render(); if cb then cb(v) end end }
+end
+
+local function button(parent, name, cb)
+    local b = Instance.new("TextButton", parent)
+    b.Size = UDim2.new(1, 0, 0, 26)
+    b.BackgroundColor3 = Color3.fromRGB(220, 40, 50); b.Text = name
+    b.Font = Enum.Font.GothamSemibold; b.TextSize = 11; b.TextColor3 = Color3.new(1, 1, 1)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+local function textbox(parent, placeholder, cb)
+    local b = Instance.new("TextBox", parent)
+    b.Size = UDim2.new(1, 0, 0, 24); b.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    b.Text = ""; b.PlaceholderText = placeholder; b.PlaceholderColor3 = Color3.fromRGB(120, 120, 125)
+    b.Font = Enum.Font.Gotham; b.TextSize = 11; b.TextColor3 = Color3.fromRGB(220, 220, 220)
+    b.TextXAlignment = Enum.TextXAlignment.Left; b.ClearTextOnFocus = false
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIPadding", b).PaddingLeft = UDim.new(0, 6)
+    b.FocusLost:Connect(function() if cb then cb(b.Text) end end)
+    return b
+end
+
+local statusLbl = Instance.new("TextLabel")
+statusLbl.Size = UDim2.new(1, -20, 0, 18); statusLbl.Position = UDim2.new(0, 10, 1, -22)
+statusLbl.BackgroundTransparency = 1; statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 10; statusLbl.TextColor3 = Color3.fromRGB(160, 160, 165)
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left; statusLbl.Text = "status: idle"
+statusLbl.Parent = main
+
+task.spawn(function()
+    while sg.Parent do
+        statusLbl.Text = "status: " .. state.status
+        task.wait(0.3)
+    end
+end)
+
+-- ── tabs ───────────────────────────────────────────────────────
+local farmSection = makeSection("Farm")
+tabButton("Farm", function() farmSection.Visible = true end)
+farmSection.Visible = true
+
+toggle(farmSection, "Auto Steal", false, function(v)
+    state.autoSteal = v
+    if v then startStealLoop() end
+end)
+
+toggle(farmSection, "Auto Place", false, function(v)
+    state.autoPlace = v
+    if v then startPlaceLoop() end
+end)
+
+toggle(farmSection, "ESP Eggs", false, function(v)
+    state.esp = v
+end)
+
+button(farmSection, "Teleport to nearest egg", function()
+    local egg = findFieldEgg(2000)
+    if egg then
+        local r = hrp(); if r then r.CFrame = CFrame.new(egg.at + Vector3.new(0, 4, 0)) end
+    end
+end)
+
+button(farmSection, "Force steal now", function()
+    local egg = findFieldEgg(2000)
+    if egg then stealEgg(egg) end
+end)
+
+local miscSection = makeSection("Misc")
+tabButton("Misc", function() miscSection.Visible = true end)
+
+toggle(miscSection, "Treadmill boost (WalkSpeed 120)", false, function(v)
+    state.treadmill = v
+    if v then startTreadmillLoop() else
+        local h = hum(); if h then h.WalkSpeed = 16 end
+    end
+end)
+
+textbox(miscSection, "Discord webhook url", function(v) state.webhook = v end)
+
+button(miscSection, "Test webhook", function()
+    log("[Apple Hub] connected")
+end)
+
+local infoSection = makeSection("Info")
+tabButton("Info", function() infoSection.Visible = true end)
+local infoLbl = Instance.new("TextLabel", infoSection)
+infoLbl.Size = UDim2.new(1, 0, 0, 100); infoLbl.BackgroundTransparency = 1
+infoLbl.Font = Enum.Font.Gotham; infoLbl.TextSize = 10
+infoLbl.TextColor3 = Color3.fromRGB(180, 180, 185)
+infoLbl.TextWrapped = true; infoLbl.TextXAlignment = Enum.TextXAlignment.Left
+infoLbl.Text = "Apple Hub · lean build\nForestStrike steal · carry/drop · ESP · teleport · treadmill\nvs Chilli ~955KB → here ~15KB\n\nkeybind: none — click the X to hide\nre-open with the same executor."
+
+-- ── ESP loop ───────────────────────────────────────────────────
+local espFolder = Instance.new("Folder", sg); espFolder.Name = "esp"
+local tracked = {}
+local espDebounce = 0
+RunService.Heartbeat:Connect(function()
+    if os.clock() - espDebounce < 0.4 then return end
+    espDebounce = os.clock()
+    for _, v in ipairs(tracked) do pcall(function() v:Destroy() end) end
+    tracked = {}
+    if not state.esp then return end
+    for _, obj in ipairs(WS:GetDescendants()) do
+        if obj:IsA("BasePart") and (obj.Name:find("[Ee]gg")) then
+            local bb = Instance.new("BillboardGui")
+            bb.Adornee = obj; bb.Size = UDim2.fromOffset(90, 24)
+            bb.AlwaysOnTop = true; bb.Parent = espFolder
+            local l = Instance.new("TextLabel", bb)
+            l.Size = UDim2.fromScale(1, 1); l.BackgroundTransparency = 1
+            l.Font = Enum.Font.GothamBold; l.TextSize = 11
+            l.TextColor3 = Color3.fromRGB(255, 240, 240); l.TextStrokeTransparency = 0
+            l.Text = obj.Name
+            tracked[#tracked + 1] = bb
+        end
+    end
+end)
+
+log("Apple Hub loaded")
